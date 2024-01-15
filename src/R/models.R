@@ -147,6 +147,7 @@ CAGExpansionModel <- R6Class("CAGExpansionModel", inherit=CAGBase, public=list(
     start_parameters_list = NULL,
     parameter_bounds = NULL,
     parameter_steps = NULL,
+    pdf_matrix = NULL,
     debug = FALSE,
     verbose = TRUE,
     single_start = FALSE,
@@ -163,7 +164,7 @@ CAGExpansionModel <- R6Class("CAGExpansionModel", inherit=CAGBase, public=list(
        self$start_parameters_list = start_parameters_list
        self$parameter_bounds = parameter_bounds
        self$parameter_steps = parameter_steps
-       self$state_fields = c("name", "data", "fit_score", "fitted_parameters", "fixed_parameters", "start_parameters_list", "parameter_bounds", "parameter_steps")
+       self$state_fields = c("name", "data", "fit_score", "fitted_parameters", "fixed_parameters", "start_parameters_list", "parameter_bounds", "parameter_steps", "pdf_matrix")
     },
 
     fit = function(data=NULL, method="BFGS") {
@@ -220,19 +221,63 @@ CAGExpansionModel <- R6Class("CAGExpansionModel", inherit=CAGBase, public=list(
         return(invisible(self))
     },
 
+    get_min_observed_cag = function() {
+        min(sapply(self$data, function(d) { min(d$observed) }))
+    },
+
+    condition_cag_dist = function(cag_dist, min_cag) {
+        result = cag_dist
+        if (min_cag <= length(result)) {
+            cond = min(cag_dist[cag_dist > 0])
+            indexes = seq(min_cag, length(result), 1)
+            result[indexes] = pmax(result[indexes], cond)
+            result = result/sum(result)
+        }
+        return(result)
+    },
+
+    generate_inherited_cag_dist = function(inh_cag, inh_cag_sd, n) {
+        epsilon = 0.001
+        probs = dnorm(1:n,mean=inh_cag,sd=inh_cag_sd)
+        probs[probs < epsilon] = 0
+        probs = probs/sum(probs)
+        return(probs)
+    },
+
+    # For debugging ...
+    compose = function(mat, vec) {
+        result = rep(0, ncol(mat))
+        for (i in 1:length(vec)) {
+            result = result + vec[i]*mat[i,]
+        }
+        return(result)
+    },
+
     run_fit_model = function(params) {
         score = 0
+        min_cag = self$get_min_observed_cag()
         for (i in 1:length(self$data)) {
             age = self$data[[i]]$donor$age
             inherited = self$data[[i]]$donor$inherited_cag
+            inherited_sd = self$fixed_parameters$inherited_cag_sd
             loss_factor = self$compute_loss_factor(self$data[[i]])
             #cat(sprintf("#DBG: generate_Qmatrix\n"))
             Qmatrix = self$generate_Qmatrix(params)
             #cat(sprintf("#DBG: generate_Qmatrix done\n"))
             #cat(sprintf("#DBG: calling expm\n"))
-            cag_dist = expm::expm(Qmatrix * age)[inherited,]
+            if (is.null(inherited_sd)) {
+                cag_dist = expm::expm(Qmatrix * age)[inherited,]
+            } else {
+                inherited_cag_dist = self$generate_inherited_cag_dist(inherited, inherited_sd, nrow(Qmatrix))
+                #cat(sprintf("#DBG: inherited_cag_dist:\n"))
+                #print(inherited_cag_dist)
+                cag_dist = (inherited_cag_dist %*% expm::expm(Qmatrix * age))[1,]
+            }
+            cag_dist = self$condition_cag_dist(cag_dist, min_cag)
+            #cat(sprintf("#DBG: cag_dist:\n"))
+            #print(cag_dist)            
             #cat(sprintf("#DBG: calling score_model\n"))
-            data_set_score = self$score_model(self$data[[i]]$observed, loss_factor, cag_dist)
+            data_set_score = self$score_model(self$data[[i]], cag_dist)
             #cat(sprintf("#DBG: adding score\n"))
             score = score + data_set_score
             if (self$debug) {
@@ -260,17 +305,74 @@ CAGExpansionModel <- R6Class("CAGExpansionModel", inherit=CAGBase, public=list(
         stop(sprintf("Model %s failed to override generate_Qmatrix", self$name))
     },
 
-    score_model = function(cag_observed, loss_factor, model_cag_dist) {
+    score_model = function(data, model_cag_dist) {
+        LOG_LIKELIHOOD_MIN = -1e9
         log_likelihood = 0
+        if (any(is.nan(model_cag_dist))) {
+            # Handle overflow in the calculations (generally a parameter too far out of range to be reasonable)
+            log_likelihood = LOG_LIKELIHOOD_MIN
+            return(log_likelihood)
+        }
+        cag_observed = data$observed
         for (val in cag_observed) {
+            #cat(sprintf("#DBG: val %d -> %s\n", val, log10(model_cag_dist[min(val, length(model_cag_dist))])))
             log_likelihood = log_likelihood + log10(model_cag_dist[min(val, length(model_cag_dist))])
         }
-        # Include cell loss factor adjustment
-        log_likelihood = log_likelihood + loss_factor * length(cag_observed) * log10(model_cag_dist[length(model_cag_dist)])
+        ## DEBUG
+        #log_likelihood = log_likelihood + self$compute_model_loss_likelihood(data, model_cag_dist)
+        loss_likelihood = self$compute_model_loss_likelihood(data, model_cag_dist)
+        cat(sprintf("#DBG: Model LL base=%s + loss=%s = %s\n", log_likelihood, loss_likelihood, log_likelihood + loss_likelihood))
+        log_likelihood = log_likelihood + loss_likelihood
+
         if (is.nan(log_likelihood) | is.infinite(log_likelihood)) {
-            log_likelihood = -1e9
+            log_likelihood = LOG_LIKELIHOOD_MIN
         }
         return(log_likelihood)
+    },
+
+    compute_model_loss_likelihood = function(data, model_cag_dist) {
+        loss_factor = self$compute_loss_factor(data)
+        cag_observed = data$observed
+        if (loss_factor <= 0) {
+            return(0)
+        }
+        lossModel = self$fixed_parameters$loss_model
+        if (is.null(lossModel) || lossModel == "original") {
+            # Original cell loss model
+            return(loss_factor * length(cag_observed) * log10(model_cag_dist[length(model_cag_dist)]))
+        } else if (lossModel == "betabinom") {
+            # Beta-binomial loss model
+            # TBD: Should we be capping the obs_fraction here?
+            # Or use loss_factor (which is capped) and convert to loss_fraction via loss_fracion = loss_factor/(1+loss_factor) ?
+            maxcag = self$fixed_parameters$max_cag
+            data_value = sum(data$observed >= maxcag)/length(data$observed)
+            nobs = length(cag_observed)
+            obs_below_T = sum(cag_observed < maxcag)
+            prob = 1 - model_cag_dist[length(model_cag_dist)]
+            n = round(nobs * (1+loss_factor))
+            rho = self$fixed_parameters$rho
+            if (is.null(rho)) {
+                rho = 0
+            }
+            dbb = dbetabinom(obs_below_T, n, prob, rho, log=TRUE)/exp(10)
+            cat(sprintf("Applying beta-binomial loss model: k=%d n=%d p=%1.5f rho=%1.6f dbb=%s\n", obs_below_T, n, prob, rho, dbb))
+            return(100*dbb)
+            weight = 100
+            return(weight * dbetabinom(obs_below_T, n, prob, rho, log=TRUE)/exp(10))
+
+            # OLD
+            loss_fraction = self$get_loss_fraction(data)
+            obs_fraction = 1 - loss_fraction
+            n = round(nobs / obs_fraction)
+            rho = self$fixed_parameters$rho
+            if (is.null(rho)) {
+                rho = 0
+            }
+            cat(sprintf("Applying beta-binomial loss model: k=%d n=%d p=%1.5f rho=%1.6f\n", nobs, n, obs_fraction, rho))
+            return(dbetabinom(nobs, n, obs_fraction, rho, log=TRUE)/exp(10))
+        } else {
+            stop(sprintf("Unrecognized loss model: %s", lossModel))
+        }
     },
 
     compute_loss_factor = function(data) {
@@ -284,7 +386,7 @@ CAGExpansionModel <- R6Class("CAGExpansionModel", inherit=CAGBase, public=list(
                 # Default loss cap and cache in fixed_parameters for posterity
                 loss_cap = 0.90
                 self$fixed_parameters = append(self$fixed_parameters, list(loss_cap))
-            }
+            } 
             adj_loss = min(loss_fraction, loss_cap)
             loss_factor = adj_loss/(1-adj_loss)
         }
@@ -325,9 +427,9 @@ CAGExpansionModel <- R6Class("CAGExpansionModel", inherit=CAGBase, public=list(
                numeric(1))
     },
 
-    plot_fit = function(title=NULL, id=FALSE) {
-        cat(sprintf("%s: plot_fit ...\n", date()))
-        plots = lapply(self$data, self$plot_fit1, id=id)
+    plot_fit = function(title=NULL, id=FALSE, plot.last.bin=FALSE) {
+        #cat(sprintf("%s: plot_fit ...\n", date()))
+        plots = lapply(self$data, self$plot_fit1, id=id, plot.last.bin=plot.last.bin)
         if (length(self$data) == 1) {
             result = plots[[1]]
         } else {
@@ -347,17 +449,26 @@ CAGExpansionModel <- R6Class("CAGExpansionModel", inherit=CAGBase, public=list(
 
     plot_fit_pdf = function(data, id=FALSE, plot.last.bin=FALSE) {
         xlim1 = 1
+        max_cag = self$fixed_parameters$max_cag
         if (plot.last.bin) {
-            xlim2 = self$fixed_parameters$max_cag
+            xlim2 = max_cag
         } else {
-            xlim2 = self$fixed_parameters$max_cag - 1
+            xlim2 = max_cag - 1
         }
         xseq = seq(xlim1, xlim2)
         cags = pmin(data$observed, rep(self$fixed_parameters$max_cag, length(data$observed)))
         data_hist = sapply(xseq, function(x) { sum(cags == x) })
         model_hist = self$get_model_dist()[xseq]
+
         loss_factor = self$compute_loss_factor(data)
-        model_hist = model_hist * (1+loss_factor)
+        model_hist = model_hist * (1 + loss_factor)
+        if (plot.last.bin) {
+            nobs = length(cags)
+            last_bin_scale_factor = 1 - (nobs*loss_factor) / (sum(cags == max_cag) + nobs*loss_factor)
+            #cat(sprintf("#DBG: LF = %s, last_bin_scale_factor = %s\n", loss_factor, last_bin_scale_factor))
+            model_hist[max_cag] = model_hist[max_cag] * last_bin_scale_factor
+        }
+
         plot_data = data.frame(CAG=xseq, data=data_hist, model=model_hist)
         plot =
             ggplot(plot_data) +
@@ -374,15 +485,23 @@ CAGExpansionModel <- R6Class("CAGExpansionModel", inherit=CAGBase, public=list(
 
     plot_fit_cdf = function(data, id=FALSE, plot.last.bin=FALSE) {
         xlim1 = 1
+        max_cag = self$fixed_parameters$max_cag
         if (plot.last.bin) {
-            xlim2 = self$fixed_parameters$max_cag
+            xlim2 = max_cag
         } else {
-            xlim2 = self$fixed_parameters$max_cag - 1
+            xlim2 = max_cag - 1
         }
         xseq = seq(xlim1, xlim2)
         cags = pmin(data$observed, rep(self$fixed_parameters$max_cag, length(data$observed)))
         data_hist = sapply(xseq, function(x) { sum(cags == x) })
         model_hist = self$get_model_dist()[xseq]
+        if (plot.last.bin) {
+            nobs = length(cags)
+            loss_factor = self$compute_loss_factor(data)
+            last_bin_scale_factor = 1 - (nobs*loss_factor) / (sum(cags == max_cag) + nobs*loss_factor)
+            #cat(sprintf("#DBG: LF = %s, last_bin_scale_factor = %s\n", loss_factor, last_bin_scale_factor))
+            model_hist[max_cag] = model_hist[max_cag] * last_bin_scale_factor
+        }
         data_cdf = cumsum(data_hist)/sum(data_hist)
         model_cdf = cumsum(model_hist)/sum(model_hist)
         plot_data = data.frame(CAG=xseq, data=data_cdf, model=model_cdf)
@@ -416,18 +535,20 @@ CAGExpansionModel <- R6Class("CAGExpansionModel", inherit=CAGBase, public=list(
         model_probs = (probs - 0.5/maxcag)
         model_quantiles = sapply(model_probs, function(p) { match(TRUE, model_cdf >= p) })
 
-
         plot_data = data.table(probs=probs, data=data_quantiles, model=model_quantiles)
         #cat(sprintf("#DBG:\n"))
         #write.table(plot_data)
         minplot = min(plot_data$data, plot_data$model)
         maxplot = max(plot_data$data, plot_data$model)
         plot_width = maxplot-minplot
-
-        kstest = suppressWarnings(ks.test(plot_data$data, plot_data$model))
-        kstext = sprintf("KS p=%1.3f", kstest$p.value)
-        #cat(sprintf("#DBG: kstest:\n"))
-        #print(kstext)
+        kstext = "KS p=NA"
+        if (!all(is.na(plot_data$model))) {
+            # Handle corner case of no model fit
+            kstest = suppressWarnings(ks.test(plot_data$data, plot_data$model))
+            kstext = sprintf("KS p=%1.3f", kstest$p.value)
+            #cat(sprintf("#DBG: kstest:\n"))
+            #print(kstext)
+        }
 
         plot =
             ggplot(plot_data) +
@@ -449,6 +570,12 @@ CAGExpansionModel <- R6Class("CAGExpansionModel", inherit=CAGBase, public=list(
         maxcag = self$fixed_parameters$max_cag
         data_value = sum(data$observed >= maxcag)/length(data$observed)
         loss_factor = self$compute_loss_factor(data)
+
+        ## DEBUG
+        #adv = min((data_value + loss_factor) / (1 + loss_factor), 1.0)
+        #mv = self$get_model_pdf(data$donor)[maxcag]
+        #cat(sprintf("#DBG: donor=%s maxcag=%s dv=%s lf=%s adjdv=%s mv=%s\n", data$donor$id, maxcag, data_value, loss_factor, adv, mv))
+
         # Adjust data value for loss estimate
         data_value = (data_value + loss_factor) / (1 + loss_factor)
         data_value = min(data_value, 1.0)
@@ -511,11 +638,39 @@ CAGExpansionModel <- R6Class("CAGExpansionModel", inherit=CAGBase, public=list(
         }
         colnames(cags) = times
         rownames(cags) = probs
-#        cags = sapply(times, function(t) { pdf = expm::expm(Qmatrix*t)[inherited,];
-#                                           #cat(sprintf("#DBG: pdf(%d):\n", t));
-#                                           #print(pdf);
-#                                           sum(seq(1:length(pdf))*pdf) })
         return(cags)
+    },
+
+    get_model_pdf_matrix = function(donor=NULL, times=seq(0,100,1), maxcag=NULL, verbose=FALSE) {
+        data = self$get_data_for_donor(donor)
+        if (is.null(data)) {
+            return(NULL)
+        }
+        inherited = data$donor$inherited_cag
+        if (verbose) {
+            cat(sprintf("%s get_model_pdf_matrix: computing Qmatrix ...\n", date()))
+        }
+        Qmatrix = self$generate_Qmatrix(self$fitted_parameters, maxcag)
+        pdfs = sapply(times,
+                      function(t) {
+                          if (verbose) {
+                              cat(sprintf("%s get_model_pdf_matrix: computing pdf (t=%s) ...\n", date(), t))
+                          }
+                          if (t == 0) {
+                              pdf = rep(0,nrow(Qmatrix))
+                              pdf[inherited] = 1
+                          } else {
+                              pdf = expm::expm(Qmatrix*t)[inherited,];
+                          }
+                          return(pdf) })
+        if (length(times) == 1) {
+            pdfs = matrix(pdfs, ncol=1)
+        }
+        colnames(pdfs) = times
+        if (verbose) {
+            cat(sprintf("%s get_model_pdf_matrix: computed pdf matrix [%d,%d].\n", date(), nrow(pdfs), ncol(pdfs)))
+        }
+        return(pdfs)
     },
 
     # private
@@ -680,6 +835,17 @@ CAGExpansionModel <- R6Class("CAGExpansionModel", inherit=CAGBase, public=list(
             Q[i, i] = -(expansion_rate + contraction_rate)
         }
         return(Q)
+    },
+
+    default_max_cag = function(maxcag) {
+        if (!is.null(maxcag)) {
+            return(maxcag)
+        }
+        maxcag = self$fixed_parameters$max_cag
+        if (!is.null(maxcag)) {
+            return(maxcag)
+        }
+        stop(sprintf("%s Cannot determine default max cag value", self$name))
     }
 ))
 
@@ -687,9 +853,9 @@ CAGExpansionModel$load = function(inFile) {
     CAGBase$load(inFile)
 }
 
-TwoPhaseModel = R6Class("TwoPhaseModel", inherit=CAGExpansionModel, public=list(
+TwoPhaseLinearModel = R6Class("TwoPhaseLinearModel", inherit=CAGExpansionModel, public=list(
     initialize = function(data=NULL) {
-        super$initialize(name="TwoPhase",
+        super$initialize(name="TwoPhaseLinear",
                          data=data,
                          fixed_parameters=
                              list(max_cag = 180, threshold1 = 33.5),
@@ -718,16 +884,13 @@ TwoPhaseModel = R6Class("TwoPhaseModel", inherit=CAGExpansionModel, public=list(
         rates = function(x) {
             max(r1 * (x - thresh1), 0) + max(r2 * (x - thresh2), 0)
         }
-        if (is.null(maxcag)) {
-            maxcag = self$fixed_parameters$max_cag
-        }
-        return(self$generate_Q_matrix_internal(pexp, rates, maxcag, self$fixed_parameters$contraction_limit))
+        return(self$generate_Q_matrix_internal(pexp, rates, self$default_max_cag(maxcag), self$fixed_parameters$contraction_limit))
     }
 ))
 
-TwoPhaseModelSmoothed = R6Class("TwoPhaseModelSmoothed", inherit=CAGExpansionModel, public=list(
+TwoPhaseLinearModelSmoothed = R6Class("TwoPhaseLinearModelSmoothed", inherit=CAGExpansionModel, public=list(
     initialize = function(data=NULL) {
-        super$initialize(name="TwoPhaseSmoothed",
+        super$initialize(name="TwoPhaseLinearSmoothed",
                          data=data,
                          fixed_parameters=
                              list(max_cag = 180, threshold1 = 33.5),
@@ -748,7 +911,7 @@ TwoPhaseModelSmoothed = R6Class("TwoPhaseModelSmoothed", inherit=CAGExpansionMod
                                   threshold2 = 0.1,
                                   smooth.radius = 0.1))
     },
-    generate_Qmatrix = function(params) {
+    generate_Qmatrix = function(params, maxcag=NULL) {
         # Note: params here are by position and are not named
         r1 = params[[1]]
         r2 = params[[2]]
@@ -768,7 +931,7 @@ TwoPhaseModelSmoothed = R6Class("TwoPhaseModelSmoothed", inherit=CAGExpansionMod
             ## This didn't really pan out ...
             ##return(smooth_between(x,r1,r2,thresh2,smooth.radius)*(x-thresh1))
         }
-        return(self$generate_Q_matrix_internal(pexp, rates, self$fixed_parameters$max_cag, self$fixed_parameters$contraction_limit))
+        return(self$generate_Q_matrix_internal(pexp, rates, self$default_max_cag(maxcag), self$fixed_parameters$contraction_limit))
     }
 ))
 
@@ -793,7 +956,7 @@ TwoPhaseModelExp1 = R6Class("TwoPhaseModelExp1", inherit=CAGExpansionModel, publ
                                   threshold2 = 0.1,
                                   exp2 = 0.1))
     },
-    generate_Qmatrix = function(params) {
+    generate_Qmatrix = function(params, maxcag=NULL) {
         # Linear to thresh2, then power law to see what value of the exponent is suggested:
         # r1 * (x-thresh1) + r2 * (x-thresh2)^a
  
@@ -813,7 +976,7 @@ TwoPhaseModelExp1 = R6Class("TwoPhaseModelExp1", inherit=CAGExpansionModel, publ
             }
             return(r1 * (x-thresh1) + r2 * (x-thresh2)^exp2)
         }
-        return(self$generate_Q_matrix_internal(pexp, rates, self$fixed_parameters$max_cag))
+        return(self$generate_Q_matrix_internal(pexp, rates, self$default_max_cag(maxcag)))
     }
 ))
 
@@ -841,7 +1004,7 @@ TwoPhaseModelExp2 = R6Class("TwoPhaseModelExp2", inherit=CAGExpansionModel, publ
                                   exp2 = 0.1))
     },
     generate_Qmatrix = function(params, maxcag=NULL) {
-        # Arbitrary power in both phases:
+        # Two power-law phases with fitted exponents and rate constants in both phases:
         # r1 * (x-thresh1)^a1 + r2 * (x-thresh2)^a2
  
         # Note: params here are by position and are not named
@@ -861,10 +1024,114 @@ TwoPhaseModelExp2 = R6Class("TwoPhaseModelExp2", inherit=CAGExpansionModel, publ
             }
             return(r1 * (x-thresh1)^exp1 + r2 * (x-thresh2)^exp2)
         }
-        if (is.null(maxcag)) {
-            maxcag = self$fixed_parameters$max_cag
+        return(self$generate_Q_matrix_internal(pexp, rates, self$default_max_cag(maxcag)))
+    }
+))
+
+# More consistent name for TwoPhaseModelExp2
+# Also change default maxcag threshold to 150
+TwoPhasePowerModel = R6Class("TwoPhasePowerModel", inherit=CAGExpansionModel, public=list(
+    initialize = function(data=NULL) {
+        super$initialize(name="TwoPhasePower",
+                         data=data,
+                         fixed_parameters=
+                             list(max_cag = 150, threshold1 = 33.5),
+                         start_parameters_list=
+                             list(list(rate1 = 0.1, rate2 = 1, pexp = 0.7, threshold2 = 65, exp1=1, exp2=1)),
+                         parameter_bounds=
+                             list(rate1 = c(0.001, 0.3),
+                                  rate2 = c(0.001, 3),
+                                  pexp =  c(0.5, 1),
+                                  threshold2 = c(40, 100),
+                                  exp1 = c(0.5,3),
+                                  exp2 = c(0.1,3)),
+                         parameter_steps =
+                             list(rate1 = 0.001,
+                                  rate2 = 0.01,
+                                  pexp = 0.001,
+                                  threshold2 = 0.1,
+                                  exp1 = 0.1,
+                                  exp2 = 0.1))
+    },
+    generate_Qmatrix = function(params, maxcag=NULL) {
+        # Two power-law phases with fitted exponents and rate constants in both phases:
+        # r1 * (x-thresh1)^a1 + r2 * (x-thresh2)^a2
+ 
+        # Note: params here are by position and are not named
+        r1 = params[[1]]
+        r2 = params[[2]]
+        pexp = params[[3]]
+        thresh1 = self$fixed_parameters$threshold1
+        thresh2 = params[[4]]
+        exp1 = params[[5]]
+        exp2 = params[[6]]
+        rates = function(x) {
+            if (x < thresh1) {
+                return(0)
+            }
+            if (x < thresh2) {
+                return(r1 * (x-thresh1)^exp1)
+            }
+            return(r1 * (x-thresh1)^exp1 + r2 * (x-thresh2)^exp2)
         }
-        return(self$generate_Q_matrix_internal(pexp, rates, maxcag))
+        return(self$generate_Q_matrix_internal(pexp, rates, self$default_max_cag(maxcag)))
+    }
+))
+
+TwoPhaseModelExp2ExpOnly = R6Class("TwoPhaseModelExp2ExpOnly", inherit=CAGExpansionModel, public=list(
+    initialize = function(data=NULL) {
+        super$initialize(name="TwoPhaseExp2ExpOnly",
+                         data=data,
+                         fixed_parameters=
+                             list(max_cag = 180, threshold1 = 33.5, pexp=1, inherited_cag_sd=1.0),
+#                         fixed_parameters=
+#                             list(max_cag = 180, threshold1 = 33.5, pexp=1),
+                         start_parameters_list=
+                             list(list(rate1 = 0.1, rate2 = 1, threshold2 = 65, exp1=1, exp2=1)),
+                         parameter_bounds=
+                             list(rate1 = c(0.00001, 0.3),
+                                  rate2 = c(0.00001, 3),
+                                  threshold2 = c(40, 100),
+                                  exp1 = c(0.01,3),
+                                  exp2 = c(0.01,3)),
+                         parameter_steps =
+                             list(rate1 = 0.001,
+                                  rate2 = 0.001,
+                                  threshold2 = 0.1,
+                                  exp1 = 0.01,
+                                  exp2 = 0.01))
+    },
+    generate_Qmatrix = function(params, maxcag=NULL) {
+        # Two power-law phases with fitted exponents and rate constants in both phases, but fixed pexp=1:
+        # r1 * (x-thresh1)^a1 + r2 * (x-thresh2)^a2
+ 
+        # Note: params here are by position and are not named
+        r1 = params[[1]]
+        r2 = params[[2]]
+        pexp = self$fixed_parameters$pexp
+        thresh1 = self$fixed_parameters$threshold1
+        thresh2 = params[[3]]
+        exp1 = params[[4]]
+        exp2 = params[[5]]
+        rates = function(x) {
+            if (x < thresh1) {
+                return(0)
+            }
+            if (x < thresh2) {
+                return(r1 * (x-thresh1)^exp1)
+            }
+            return(r1 * (x-thresh1)^exp1 + r2 * (x-thresh2)^exp2)
+        }
+        return(self$generate_Q_matrix_internal(pexp, rates, self$default_max_cag(maxcag)))
+    }
+))
+
+TwoPhaseModelExp2BB = R6Class("TwoPhaseModelExp2BB", inherit=TwoPhaseModelExp2, public=list(
+    initialize = function(data=NULL) {
+        super$initialize()
+        self$name = "TwoPhaseModelExp2BB"
+        self$fixed_parameters$loss_model = "betabinom"
+        self$fixed_parameters$rho = 0.017
     }
 ))
 
@@ -916,7 +1183,7 @@ TwoPhasePowerModel = R6Class("TwoPhasePowerModel", inherit=CAGExpansionModel, pu
                                   pexp = 0.001,
                                   threshold2 = 0.1))
     },
-    generate_Qmatrix = function(params) {
+    generate_Qmatrix = function(params, maxcag=NULL) {
         # Note: params here are by position and are not named
         exp1 = params[[1]]
         exp2 = params[[2]]
@@ -926,29 +1193,158 @@ TwoPhasePowerModel = R6Class("TwoPhasePowerModel", inherit=CAGExpansionModel, pu
         rates = function(x) {
             max(x - thresh1, 0)^exp1 + max(x - thresh2, 0)^exp2
         }
-        return(self$generate_Q_matrix_internal(pexp, rates, self$fixed_parameters$max_cag))
+        return(self$generate_Q_matrix_internal(pexp, rates, self$default_max_cag(maxcag)))
+    }
+))
+
+OnePhaseLinearModel = R6Class("OnePhaseLinearModel", inherit=CAGExpansionModel, public=list(
+    # Rate function: r1*(cag-t1)
+    # Currently, t1 is also fitted
+    initialize = function(data=NULL) {
+        super$initialize(name="OnePhaseLinear",
+                         data=data,
+                         fixed_parameters=
+                             list(max_cag = 150),
+                         start_parameters_list=
+                             list(list(rate1 = 1, thresh1 = 30, pexp = 0.70),
+                                  list(rate1 = 1.5, thresh1 = 35, pexp = 0.65)),
+                         parameter_bounds=
+                             list(rate1 = c(0.01,5),
+                                  thresh1 = c(20,100),
+                                  pexp =  c(0.5, 1)),
+                         parameter_steps =
+                             list(rate1 = 0.01,
+                                  thresh1 = 1,
+                                  pexp = 0.001))
+    },
+    generate_Qmatrix = function(params, maxcag=NULL) {
+        # Note: params here are by position and are not named
+        rate1 = params[[1]]
+        thresh1 = params[[2]]
+        pexp = params[[3]]
+        rates = function(x) {
+            rate1 * max(x - thresh1, 0)
+        }
+        return(self$generate_Q_matrix_internal(pexp, rates, self$default_max_cag(maxcag)))
+    }
+))
+
+OnePhaseLogModel = R6Class("OnePhaseLogModel", inherit=CAGExpansionModel, public=list(
+    # Rate function: r1*log(cag-t1)
+    # Currently, t1 is also fitted
+    initialize = function(data=NULL) {
+        super$initialize(name="OnePhaseLog",
+                         data=data,
+                         fixed_parameters=
+                             list(max_cag = 150),
+                         start_parameters_list=
+                             list(list(rate1 = 1, thresh1 = 30, pexp = 0.70),
+                                  list(rate1 = 1.5, thresh1 = 35, pexp = 0.65)),
+                         parameter_bounds=
+                             list(rate1 = c(0.01,5),
+                                  thresh1 = c(20,100),
+                                  pexp =  c(0.5, 1)),
+                         parameter_steps =
+                             list(rate1 = 0.01,
+                                  thresh1 = 1,
+                                  pexp = 0.001))
+    },
+    generate_Qmatrix = function(params, maxcag=NULL) {
+        # Note: params here are by position and are not named
+        rate1 = params[[1]]
+        thresh1 = params[[2]]
+        pexp = params[[3]]
+        rates = function(x) {
+            rate1 * log(1 + max(x - thresh1, 0))
+        }
+        return(self$generate_Q_matrix_internal(pexp, rates, self$default_max_cag(maxcag)))
+    }
+))
+
+OnePhaseQuadraticModel = R6Class("OnePhaseQuadraticModel", inherit=CAGExpansionModel, public=list(
+    # Rate function: r1*(cag-t1)^2
+    # Currently, t1 is also fitted
+    initialize = function(data=NULL) {
+        super$initialize(name="OnePhaseQuadratic",
+                         data=data,
+                         fixed_parameters=
+                             list(max_cag = 150),
+                         start_parameters_list=
+                             list(list(rate1 = 1, thresh1 = 30, pexp = 0.70),
+                                  list(rate1 = 1.5, thresh1 = 35, pexp = 0.65)),
+                         parameter_bounds=
+                             list(rate1 = c(0.00001,2),
+                                  thresh1 = c(20,100),
+                                  pexp =  c(0.5, 1)),
+                         parameter_steps =
+                             list(rate1 = 0.00001,
+                                  thresh1 = 1,
+                                  pexp = 0.001))
+    },
+    generate_Qmatrix = function(params, maxcag=NULL) {
+        # Note: params here are by position and are not named
+        rate1 = params[[1]]
+        thresh1 = params[[2]]
+        pexp = params[[3]]
+        rates = function(x) {
+            rate1 * max(x - thresh1, 0)^2
+        }
+        return(self$generate_Q_matrix_internal(pexp, rates, self$default_max_cag(maxcag)))
+    }
+))
+
+OnePhaseCubicModel = R6Class("OnePhaseCubicModel", inherit=CAGExpansionModel, public=list(
+    # Rate function: r1*(cag-t1)^3
+    # Currently, t1 is also fitted
+    initialize = function(data=NULL) {
+        super$initialize(name="OnePhaseCubic",
+                         data=data,
+                         fixed_parameters=
+                             list(max_cag = 150),
+                         start_parameters_list=
+                             list(list(rate1 = 1, thresh1 = 30, pexp = 0.70),
+                                  list(rate1 = 1.5, thresh1 = 35, pexp = 0.65)),
+                         parameter_bounds=
+                             list(rate1 = c(0.00001,2),
+                                  thresh1 = c(20,100),
+                                  pexp =  c(0.5, 1)),
+                         parameter_steps =
+                             list(rate1 = 0.00001,
+                                  thresh1 = 1,
+                                  pexp = 0.001))
+    },
+    generate_Qmatrix = function(params, maxcag=NULL) {
+        # Note: params here are by position and are not named
+        rate1 = params[[1]]
+        thresh1 = params[[2]]
+        pexp = params[[3]]
+        rates = function(x) {
+            rate1 * max(x - thresh1, 0)^3
+        }
+        return(self$generate_Q_matrix_internal(pexp, rates, self$default_max_cag(maxcag)))
     }
 ))
 
 OnePhasePowerModel = R6Class("OnePhasePowerModel", inherit=CAGExpansionModel, public=list(
+    # Rate function: r1*(cag-t1)^e1
     initialize = function(data=NULL) {
         super$initialize(name="OnePhasePower",
                          data=data,
                          fixed_parameters=
-                             list(max_cag = 180, threshold1 = 30),
+                             list(max_cag = 150, threshold1 = 33.5),
                          start_parameters_list=
                              list(list(rate1 = 1, exp1 = 1, pexp = 0.7),
                                   list(rate1 = 1.5, exp1 = 1.5, pexp = 0.65)),
                          parameter_bounds=
-                             list(rate1 = c(0.1,2),
+                             list(rate1 = c(0.00001,2),
                                   exp1 = c(1.0,4.0),
                                   pexp =  c(0.5, 1)),
                          parameter_steps =
-                             list(rate1 = 0.01,
+                             list(rate1 = 0.00001,
                                   exp1 = 0.01,
                                   pexp = 0.001))
     },
-    generate_Qmatrix = function(params) {
+    generate_Qmatrix = function(params, maxcag=NULL) {
         # Note: params here are by position and are not named
         rate1 = params[[1]]
         exp1 = params[[2]]
@@ -957,9 +1353,139 @@ OnePhasePowerModel = R6Class("OnePhasePowerModel", inherit=CAGExpansionModel, pu
         rates = function(x) {
             rate1 * max(x - thresh1, 0)^exp1
         }
-        return(self$generate_Q_matrix_internal(pexp, rates, self$fixed_parameters$max_cag))
+        return(self$generate_Q_matrix_internal(pexp, rates, self$default_max_cag(maxcag)))
     }
 ))
+
+OnePhaseExponentialModel = R6Class("OnePhaseExponentialModel", inherit=CAGExpansionModel, public=list(
+    # Rate function: r1*b1^(k1*(cag-t1))
+    initialize = function(data=NULL) {
+        super$initialize(name="OnePhaseExponential",
+                         data=data,
+                         fixed_parameters=
+                             list(max_cag = 150, threshold1 = 33.5, max_rate = 10000),
+                         start_parameters_list=
+                             list(list(rate1 = 1, base1 = 0.8, coef1 = 1, pexp = 0.7),
+                                  list(rate1 = 1, base1 = 1.2, coef1 = 1, pexp = 0.65)),
+                         parameter_bounds=
+                             list(rate1 = c(0.00001,2),
+                                  base1 = c(0.5,3),
+                                  coef1 = c(0.001,10),
+                                  pexp =  c(0.5, 1)),
+                         parameter_steps =
+                             list(rate1 = 0.00001,
+                                  base1 = 0.001,
+                                  coef1 = 0.001,
+                                  pexp = 0.001))
+    },
+    generate_Qmatrix = function(params, maxcag=NULL) {
+        # Note: params here are by position and are not named
+        rate1 = params[[1]]
+        base1 = params[[2]]
+        coef1 = params[[3]]
+        pexp = params[[4]]
+        thresh1 = self$fixed_parameters$threshold1
+        max_rate = self$fixed_parameters$max_rate
+        rates = function(x) {
+            min(max_rate, rate1 * (base1 ^ (coef1 * max(x - thresh1, 0))))
+        }
+        return(self$generate_Q_matrix_internal(pexp, rates, self$default_max_cag(maxcag)))
+    }
+))
+
+OnePhaseExponentialNoCoefModel = R6Class("OnePhaseExponentialNoCoefModel", inherit=CAGExpansionModel, public=list(
+    # Rate function: r1*b1^(cag-t1)
+    # Same as exponential model, but drop the coefficient on the exponent
+    initialize = function(data=NULL) {
+        super$initialize(name="OnePhaseExponentialNoCoef",
+                         data=data,
+                         fixed_parameters=
+                             list(max_cag = 150, threshold1 = 33.5, max_rate = 10000),
+                         start_parameters_list=
+                             list(list(rate1 = 1, base1 = 0.8, pexp = 0.7),
+                                  list(rate1 = 1, base1 = 1.2, pexp = 0.65)),
+                         parameter_bounds=
+                             list(rate1 = c(0.00001,2),
+                                  base1 = c(0.5,3),
+                                  pexp =  c(0.5, 1)),
+                         parameter_steps =
+                             list(rate1 = 0.00001,
+                                  base1 = 0.001,
+                                  pexp = 0.001))
+    },
+    generate_Qmatrix = function(params, maxcag=NULL) {
+        # Note: params here are by position and are not named
+        rate1 = params[[1]]
+        base1 = params[[2]]
+        pexp = params[[3]]
+        thresh1 = self$fixed_parameters$threshold1
+        max_rate = self$fixed_parameters$max_rate
+        rates = function(x) {
+            min(max_rate, rate1 * (base1 ^ max(x - thresh1, 0)))
+        }
+        return(self$generate_Q_matrix_internal(pexp, rates, self$default_max_cag(maxcag)))
+    }
+))
+
+MultiSegLinearModelBase = R6Class("MultiSegLinearModelBase", inherit=CAGExpansionModel, public=list(
+    initialize = function(data=NULL, nsegments=1) {
+        rateParams = sprintf("rate%d", seq(1:nsegments))
+        distParams = sprintf("dist%d", seq(1:nsegments))
+        # pexp
+        parameterStarts = list(pexp = c(0.7))
+        parameterBounds = list(pexp = c(0.5, 1))
+        parameterSteps = list(pexp = 0.001)
+        # N rate parameters
+        for (i in seq(1,nsegments)) {
+            parameterStarts = append(parameterStarts, list(1))
+            parameterBounds = append(parameterBounds, list(c(0,10)))
+            parameterSteps = append(parameterSteps, list(0.001))
+        }
+        # N distance parameters
+        for (i in seq(1,nsegments)) {
+            parameterStarts = append(parameterStarts, list(ifelse(i==1,30,1)))
+            parameterBounds = append(parameterBounds, list(c(1,100)))
+            parameterSteps = append(parameterSteps, list(1))
+        }
+        names(parameterStarts) = c("pexp", sprintf("rate%d", seq(1:nsegments)), sprintf("dist%d", seq(1:nsegments)))
+        names(parameterBounds) = c("pexp", sprintf("rate%d", seq(1:nsegments)), sprintf("dist%d", seq(1:nsegments)))
+        names(parameterSteps) = c("pexp", sprintf("rate%d", seq(1:nsegments)), sprintf("dist%d", seq(1:nsegments)))
+        super$initialize(name=sprintf("MultiSegLinear%d", nsegments),
+                         data=data,
+                         fixed_parameters=
+                             list(max_cag = 150, nsegments=nsegments),
+                         start_parameters_list=list(parameterStarts),
+                         parameter_bounds=parameterBounds,
+                         parameter_steps = parameterSteps)
+    },
+    generate_Qmatrix = function(params, maxcag=NULL) {
+        # Note: params here are by position and are not named
+        nsegments = self$fixed_parameters$nsegments
+        pexp = params[[1]]
+        cat(sprintf("#DBG: optim [%d] pexp=%s %s %s\n",
+                    nsegments,
+                    pexp,
+                    paste(sprintf("rate%s=%s", seq(1:nsegments), params[1+seq(1:nsegments)]), collapse=" "),
+                    paste(sprintf("dist%s=%s", seq(1:nsegments), params[1+nsegments+seq(1:nsegments)]), collapse=" ")))
+        if (length(params) != 2*nsegments+1) {
+            stop("MultiSegmentModelBase: Invalid number of parameters")
+        }
+        rates = function(x) {
+            sum(sapply(1:nsegments,
+                       function(seg) { srate = params[[1+seg]]; sthresh = sum(params[seq(1+nsegments+1,1+nsegments+seg)]); max(srate * (x - sthresh), 0) }))
+        }
+        return(self$generate_Q_matrix_internal(pexp, rates, self$default_max_cag(maxcag)))
+    }
+))
+
+MultiSegLinearModel2 = R6Class("MultiSegLinearModel2", inherit=MultiSegLinearModelBase, public=list(
+    initialize = function(data=NULL) { super$initialize(data, nsegments=2) }
+))
+
+MultiSegLinearModel3 = R6Class("MultiSegLinearModel3", inherit=MultiSegLinearModelBase, public=list(
+    initialize = function(data=NULL) { super$initialize(data, nsegments=3) }
+))
+
 
 BioModel5a = R6Class("BioModel5a", inherit=CAGExpansionModel, public=list(
     initialize = function(data=NULL) {
@@ -981,7 +1507,7 @@ BioModel5a = R6Class("BioModel5a", inherit=CAGExpansionModel, public=list(
                                   pexp = 0.001,
                                   threshold2 = 0.1))
     },
-    generate_Qmatrix = function(params) {
+    generate_Qmatrix = function(params, maxcag=NULL) {
         # Note: params here are by position and are not named
         c1 = params[[1]]
         c2 = params[[2]]
@@ -999,7 +1525,7 @@ BioModel5a = R6Class("BioModel5a", inherit=CAGExpansionModel, public=list(
             }
             return(rate)
         }
-        return(self$generate_Q_matrix_internal(pexp, rates, self$fixed_parameters$max_cag))
+        return(self$generate_Q_matrix_internal(pexp, rates, self$default_max_cag(maxcag)))
     }
 ))
 
@@ -1023,7 +1549,7 @@ BioModel5x = R6Class("BioModel5x", inherit=CAGExpansionModel, public=list(
                                   pexp = 0.001,
                                   threshold2 = 0.1))
     },
-    generate_Qmatrix = function(params) {
+    generate_Qmatrix = function(params, maxcag=NULL) {
         # Note: params here are by position and are not named
         r1 = params[[1]]
         r2 = params[[2]]
@@ -1033,7 +1559,7 @@ BioModel5x = R6Class("BioModel5x", inherit=CAGExpansionModel, public=list(
         rates = function(x) {
             max(r1 * (x - thresh1)^2, 0) + max(r2 * (x - thresh2)^2, 0)
         }
-        return(self$generate_Q_matrix_internal(pexp, rates, self$fixed_parameters$max_cag))
+        return(self$generate_Q_matrix_internal(pexp, rates, self$default_max_cag(maxcag)))
     }
 ))
 
@@ -1057,7 +1583,7 @@ BioModel5b = R6Class("BioModel5b", inherit=CAGExpansionModel, public=list(
                                   pexp = 0.001,
                                   threshold2 = 0.1))
     },
-    generate_Qmatrix = function(params) {
+    generate_Qmatrix = function(params, maxcag=NULL) {
         # Note: params here are by position and are not named
         r1 = params[[1]]
         r2 = params[[2]]
@@ -1074,7 +1600,7 @@ BioModel5b = R6Class("BioModel5b", inherit=CAGExpansionModel, public=list(
             }
             return(rate)
         }
-        return(self$generate_Q_matrix_internal(pexp, rates, self$fixed_parameters$max_cag))
+        return(self$generate_Q_matrix_internal(pexp, rates, self$default_max_cag(maxcag)))
     }
 ))
 
@@ -1098,7 +1624,7 @@ BioModel5c = R6Class("BioModel5c", inherit=CAGExpansionModel, public=list(
                                   pexp = 0.001,
                                   threshold2 = 0.1))
     },
-    generate_Qmatrix = function(params) {
+    generate_Qmatrix = function(params, maxcag=NULL) {
         # Note: params here are by position and are not named
         r1 = params[[1]]
         r2 = params[[2]]
@@ -1115,8 +1641,7 @@ BioModel5c = R6Class("BioModel5c", inherit=CAGExpansionModel, public=list(
             }
             return(rate)
         }
-        return(self$generate_Q_matrix_internal(pexp, rates, self$fixed_parameters$max_cag))
+        return(self$generate_Q_matrix_internal(pexp, rates, self$default_max_cag(maxcag)))
     }
 ))
 
-                        

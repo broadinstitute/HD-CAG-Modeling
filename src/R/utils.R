@@ -29,6 +29,7 @@ CAGModeling$init = function(load.philentropy=FALSE, load.optimization=FALSE) {
         CAGModeling$loadLibrary("RColorBrewer")
         CAGModeling$loadLibrary("ggfortify")
         CAGModeling$loadLibrary("expm")
+        CAGModeling$loadLibrary("VGAM")
         CAGModeling$initialized = TRUE
     }
 
@@ -66,12 +67,12 @@ CAGModeling$mergeModelFiles = function(inputFileList, outputFile) {
     saveRDS(outputDataList, outputFile)
 }
 
-CAGModeling$readDonorInfo = function(fileName) {
+CAGModeling$readDonorInfo = function(filePath) {
     result = NULL
-    fileData = fread(fileName, header=T, sep="\t")
+    fileData = fread(filePath, header=T, sep="\t")
     donors = fileData$Donor
     if (length(unique(donors)) != length(donors)) {
-        warn(sprintf("Duplicate donor names in input file: %s", fileName))
+        warn(sprintf("Duplicate donor names in input file: %s", filePath))
         return(NULL)
     }
     for (donor in donors) {
@@ -82,8 +83,8 @@ CAGModeling$readDonorInfo = function(fileName) {
     return(result)
 }
 
-CAGModeling$readCellLoss = function(fileName, dataSetList) {
-    fileData = fread(fileName, header=T, sep="\t")
+CAGModeling$readCellLoss = function(filePath, dataSetList) {
+    fileData = fread(filePath, header=T, sep="\t")
     for (dataSet in dataSetList) {
         donor = dataSet$donor$id
         region = dataSet$region
@@ -96,9 +97,9 @@ CAGModeling$readCellLoss = function(fileName, dataSetList) {
     return(dataSetList)
 }
 
-CAGModeling$readCellFile = function(fileName, donorMap, donors=NULL, regions=NULL, celltypes=NULL, minCAG=35) {
+CAGModeling$readCellFile = function(filePath, donorMap, donors=NULL, regions=NULL, celltypes=NULL, minCAG=35) {
     result = NULL
-    fileData = fread(fileName, header=T, sep="\t")
+    fileData = fread(filePath, header=T, sep="\t")
     cagData = fileData[fileData$REPLENGTH >= minCAG]
     donorList = sort(unique(cagData$DONOR))
     if (!is.null(donors)) {
@@ -130,4 +131,14 @@ CAGModeling$readCellFile = function(fileName, donorMap, donors=NULL, regions=NUL
         }
     }
     return(result)
+}
+
+CAGModeling$dumpModelFile <- function(filePath) {
+    models = CAGModeling$loadModels(filePath)
+    if (is.list(models)) {
+        sapply(models, function(model) { print(model) })
+    } else {
+        print(models)
+    }
+    return(invisible(NULL))
 }
