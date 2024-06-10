@@ -12,8 +12,8 @@ simulateOneStep <- function(cag, expMatrix) {
 }
 
 simulateCells <- function(model, ncells, nyears, initialCAG, maxCAG) {
-    cat(sprintf("Initial CAG:\n"))
-    print(initialCAG)
+    #cat(sprintf("Initial CAG:\n"))
+    #print(initialCAG)
     result = matrix(0, ncol=ncells, nrow=nyears+1)
     result[1,] = rep(initialCAG, ncells)
     qMatrix = model$generate_Qmatrix(model$fitted_parameters, maxCAG)

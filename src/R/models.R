@@ -261,6 +261,7 @@ CAGExpansionModel <- R6Class("CAGExpansionModel", inherit=CAGBase, public=list(
             inherited = self$data[[i]]$donor$inherited_cag
             inherited_sd = self$fixed_parameters$inherited_cag_sd
             loss_factor = self$compute_loss_factor(self$data[[i]])
+            
             #cat(sprintf("#DBG: generate_Qmatrix\n"))
             Qmatrix = self$generate_Qmatrix(params)
             #cat(sprintf("#DBG: generate_Qmatrix done\n"))
@@ -333,13 +334,21 @@ CAGExpansionModel <- R6Class("CAGExpansionModel", inherit=CAGBase, public=list(
     compute_model_loss_likelihood = function(data, model_cag_dist) {
         loss_factor = self$compute_loss_factor(data)
         cag_observed = data$observed
+        #cat(sprintf("#DBG: loss_factor = %s\n", loss_factor))
         if (loss_factor <= 0) {
             return(0)
         }
         lossModel = self$fixed_parameters$loss_model
         if (is.null(lossModel) || lossModel == "original") {
-            # Original cell loss model
-            return(loss_factor * length(cag_observed) * log10(model_cag_dist[length(model_cag_dist)]))
+            # Original cell loss model (when weight = 1.0)
+            loss_weight = 1.0
+            #cat(sprintf("#DBG: checking loss weight ...\n"))
+            #print(self$fixed_parameters$loss_weight)
+            if (!is.null(self$fixed_parameters$loss_weight)) {
+                loss_weight = self$fixed_parameters$loss_weight
+                cat(sprintf("#DBG: loss weight = %s\n", loss_weight))
+            }
+            return(loss_weight * loss_factor * length(cag_observed) * log10(model_cag_dist[length(model_cag_dist)]))
         } else if (lossModel == "betabinom") {
             # Beta-binomial loss model
             # TBD: Should we be capping the obs_fraction here?
@@ -429,7 +438,10 @@ CAGExpansionModel <- R6Class("CAGExpansionModel", inherit=CAGBase, public=list(
 
     plot_fit = function(title=NULL, id=FALSE, plot.last.bin=FALSE) {
         #cat(sprintf("%s: plot_fit ...\n", date()))
-        plots = lapply(self$data, self$plot_fit1, id=id, plot.last.bin=plot.last.bin)
+        if (is.null(title)) {
+            title = id
+        }
+        plots = lapply(self$data, self$plot_fit1, id=title, plot.last.bin=plot.last.bin)
         if (length(self$data) == 1) {
             result = plots[[1]]
         } else {
@@ -439,15 +451,67 @@ CAGExpansionModel <- R6Class("CAGExpansionModel", inherit=CAGBase, public=list(
     },
 
     plot_fit1 = function(data, id=FALSE, plot.last.bin=FALSE) {
+        title2 = ifelse(isFALSE(id), FALSE, "")
         pdf_plot = self$plot_fit_pdf(data, id, plot.last.bin=plot.last.bin)
-        cdf_plot = self$plot_fit_cdf(data, "", plot.last.bin=plot.last.bin)
-        qq_plot = self$plot_fit_qq(data, "")
-        loss_plot = self$plot_fit_loss_bars(data, id="")
+        cdf_plot = self$plot_fit_cdf(data, title2, plot.last.bin=plot.last.bin)
+        qq_plot = self$plot_fit_qq(data, title2)
+        loss_plot = self$plot_fit_loss_bars(data, id=title2)
         plot_grid(pdf_plot, cdf_plot, qq_plot, loss_plot,
                   ncol=4, rel_widths=c(2,2,2,1.5))
     },
 
     plot_fit_pdf = function(data, id=FALSE, plot.last.bin=FALSE) {
+        xlim1 = 1
+        max_cag = self$fixed_parameters$max_cag
+        if (plot.last.bin) {
+            xlim2 = max_cag
+        } else {
+            xlim2 = max_cag - 1
+        }
+        xseq = seq(xlim1, xlim2)
+        cags = pmin(data$observed, rep(self$fixed_parameters$max_cag, length(data$observed)))
+        data_hist = sapply(xseq, function(x) { sum(cags == x) })
+        #cat(sprintf("#DBG: nobs1 = %s, nobs2 = %s\n", sum(data_hist), length(cags)))
+
+        nobs = length(cags)
+        model_dist = self$get_model_pdf()[xseq]
+
+        if (plot.last.bin) {
+            loss_factor = self$compute_loss_factor(data)
+            last_bin_scale_factor = 1 - (nobs*loss_factor) / (sum(cags == max_cag) + nobs*loss_factor)
+            cat(sprintf("#DBG: LF = %s, last_bin_scale_factor = %s\n", loss_factor, last_bin_scale_factor))
+            model_dist[max_cag] = model_dist[max_cag] * last_bin_scale_factor
+        }
+
+        model_dist = model_dist / sum(model_dist)
+        model_hist = nobs * model_dist
+
+#        loss_factor = self$compute_loss_factor(data)
+#        model_hist = model_hist * (1 + loss_factor)
+#        if (plot.last.bin) {
+#            last_bin_scale_factor = 1 - (nobs*loss_factor) / (sum(cags == max_cag) + nobs*loss_factor)
+#            #cat(sprintf("#DBG: LF = %s, last_bin_scale_factor = %s\n", loss_factor, last_bin_scale_factor))
+#            model_hist[max_cag] = model_hist[max_cag] * last_bin_scale_factor
+#        }
+#        
+#        nobs = length(cags)
+#        model_hist = nobs * (model_hist / sum(model_hist))
+
+        plot_data = data.frame(CAG=xseq, data=data_hist, model=model_hist)
+        plot =
+            ggplot(plot_data) +
+            geom_col(aes(x=CAG, y=model), color="orange", fill="orange", show.legend=FALSE) +
+            geom_col(aes(x=CAG, y=data), color=NA, fill="black", width=0.5, show.legend=FALSE) +
+            labs(x="CAG length", y="Cells")
+        if (isTRUE(id)) {
+            plot = plot + ggtitle(data$donor$id)
+        } else if (typeof(id) == "character") {
+            plot = plot + ggtitle(id)
+        }
+        return(plot)
+    },
+
+    plot_fit_pdf_original = function(data, id=FALSE, plot.last.bin=FALSE) {
         xlim1 = 1
         max_cag = self$fixed_parameters$max_cag
         if (plot.last.bin) {
@@ -468,6 +532,9 @@ CAGExpansionModel <- R6Class("CAGExpansionModel", inherit=CAGBase, public=list(
             #cat(sprintf("#DBG: LF = %s, last_bin_scale_factor = %s\n", loss_factor, last_bin_scale_factor))
             model_hist[max_cag] = model_hist[max_cag] * last_bin_scale_factor
         }
+
+        nobs = length(cags)
+        model_hist = nobs * (model_hist / sum(model_hist))
 
         plot_data = data.frame(CAG=xseq, data=data_hist, model=model_hist)
         plot =
@@ -494,14 +561,40 @@ CAGExpansionModel <- R6Class("CAGExpansionModel", inherit=CAGBase, public=list(
         xseq = seq(xlim1, xlim2)
         cags = pmin(data$observed, rep(self$fixed_parameters$max_cag, length(data$observed)))
         data_hist = sapply(xseq, function(x) { sum(cags == x) })
-        model_hist = self$get_model_dist()[xseq]
+
+        nobs = length(cags)
+        model_dist = self$get_model_pdf()[xseq]
+
         if (plot.last.bin) {
-            nobs = length(cags)
             loss_factor = self$compute_loss_factor(data)
             last_bin_scale_factor = 1 - (nobs*loss_factor) / (sum(cags == max_cag) + nobs*loss_factor)
-            #cat(sprintf("#DBG: LF = %s, last_bin_scale_factor = %s\n", loss_factor, last_bin_scale_factor))
-            model_hist[max_cag] = model_hist[max_cag] * last_bin_scale_factor
+            cat(sprintf("#DBG: LF = %s, last_bin_scale_factor = %s\n", loss_factor, last_bin_scale_factor))
+            model_dist[max_cag] = model_dist[max_cag] * last_bin_scale_factor
         }
+
+        model_dist = model_dist / sum(model_dist)
+        model_hist = nobs * model_dist
+
+##        nobs = sum(data_hist)
+##        model_dist = self$get_model_pdf()[xseq]
+##        model_dist = model_dist / sum(model_dist)
+##        model_hist = nobs * model_dist
+##
+##        ###model_hist = self$get_model_dist()[xseq]
+##
+##        loss_factor = self$compute_loss_factor(data)
+##        model_hist = model_hist * (1 + loss_factor)
+##        if (plot.last.bin) {
+##            nobs = length(cags)
+##            loss_factor = self$compute_loss_factor(data)
+##            last_bin_scale_factor = 1 - (nobs*loss_factor) / (sum(cags == max_cag) + nobs*loss_factor)
+##            ### DEBUG
+##            cat(sprintf("#DBG: LF = %s, last_bin_scale_factor = %s\n", loss_factor, last_bin_scale_factor))
+##            #cat(sprintf("#DBG: mode hist[%d] = %s -> %s\n", max_cag, model_hist[max_cag], model_hist[max_cag] * last_bin_scale_factor))
+##            #print(model_hist)
+##            model_hist[max_cag] = model_hist[max_cag] * last_bin_scale_factor
+##        }
+
         data_cdf = cumsum(data_hist)/sum(data_hist)
         model_cdf = cumsum(model_hist)/sum(model_hist)
         plot_data = data.frame(CAG=xseq, data=data_cdf, model=model_cdf)
@@ -597,7 +690,7 @@ CAGExpansionModel <- R6Class("CAGExpansionModel", inherit=CAGBase, public=list(
     },
 
     # private
-    get_model_dist = function(donor=NULL) {
+    get_model_dist_old = function(donor=NULL) {
         data = self$get_data_for_donor(donor)
         if (is.null(data)) {
             return(NULL)
@@ -606,8 +699,28 @@ CAGExpansionModel <- R6Class("CAGExpansionModel", inherit=CAGBase, public=list(
         return(self$get_model_pdf(data$donor) * n)
     },
 
+    get_model_pdf = function(donor=NULL, area.scale=1) {
+        if (is.null(donor)) {
+            data = self$get_data_for_donor(donor)
+            if (is.null(data)) {
+                return(NULL)
+            } else {
+                donor = data$donor
+            }
+        }
+        return(area.scale * self$get_model_pdf_for_donor(donor))
+    },
+
+    get_model_pdf_for_donor = function(donor=NULL, area.scale=1) {
+        age = donor$age
+        inherited = donor$inherited_cag
+        Qmatrix = self$generate_Qmatrix(self$fitted_parameters)
+        model_dist = expm::expm(Qmatrix * age)[inherited,]
+        return(model_dist)
+    },
+
     # private
-    get_model_pdf = function(donor, area.scale=1) {
+    get_model_pdf_old = function(donor, area.scale=1) {
         age = donor$age
         inherited = donor$inherited_cag
         Qmatrix = self$generate_Qmatrix(self$fitted_parameters)
@@ -641,12 +754,14 @@ CAGExpansionModel <- R6Class("CAGExpansionModel", inherit=CAGBase, public=list(
         return(cags)
     },
 
-    get_model_pdf_matrix = function(donor=NULL, times=seq(0,100,1), maxcag=NULL, verbose=FALSE) {
+    get_model_pdf_matrix = function(donor=NULL, times=seq(0,100,1), maxcag=NULL, verbose=FALSE, inherited=NA) {
         data = self$get_data_for_donor(donor)
         if (is.null(data)) {
             return(NULL)
         }
-        inherited = data$donor$inherited_cag
+        if (is.na(inherited)) {
+            inherited = data$donor$inherited_cag
+        }
         if (verbose) {
             cat(sprintf("%s get_model_pdf_matrix: computing Qmatrix ...\n", date()))
         }
@@ -671,6 +786,43 @@ CAGExpansionModel <- R6Class("CAGExpansionModel", inherit=CAGBase, public=list(
             cat(sprintf("%s get_model_pdf_matrix: computed pdf matrix [%d,%d].\n", date(), nrow(pdfs), ncol(pdfs)))
         }
         return(pdfs)
+    },
+
+    # Experimental model function that generates an onset prediction curve
+    # based on varying the (single) donor's inherited repeat length after fitting
+    # the other model parameters to the donor's true inherited repeat length.
+    predict_onset_ages = function(onset_threshold, onset_fraction, inh_min, inh_max, maxage=200) {
+        # Could possibly allow this to be overridden
+        maxcag = max(self$fixed_parameters$max_cag, onset_threshold)
+        data = self$get_data_for_donor(NULL)
+        inh_range = seq(inh_min, inh_max, 1)
+        Qmatrix = self$generate_Qmatrix(self$fitted_parameters, maxcag)
+        onset_ages = rep(NA, length(inh_range))
+        names(onset_ages) = inh_range
+        test_age = 1
+        for (inherited in rev(inh_range)) {
+            prev_fraction = NA
+            while (test_age <= maxage) {
+                pdf = expm::expm(Qmatrix*test_age)[inherited,]
+                high_fraction = sum(pdf[seq(onset_threshold,maxcag,1)])
+                cat(sprintf("#DBG: test inh %s age %s pf = %1.5f hf = %1.5f\n", inherited, test_age, prev_fraction, high_fraction))
+                if (high_fraction >= onset_fraction) {
+                    if (test_age == 1) {
+                        onset_ages[inherited-inh_min+1] = test_age
+                    } else if (is.na(prev_fraction)) {
+                        stop("Error: no prev fraction for interpolation")
+                    } else {
+                        onset_age = approx(x=c(prev_fraction, high_fraction), y=c(test_age-1,test_age), xout=onset_fraction)$y
+                        onset_ages[inherited-inh_min+1] = onset_age
+                        test_age = test_age - 1
+                    }
+                    break
+                }
+                prev_fraction = high_fraction
+                test_age = test_age + 1
+            }
+        }
+        return(onset_ages)
     },
 
     # private
@@ -1163,9 +1315,9 @@ smooth_between <- function(x, v1, v2, mid, radius) {
     }
 }
 
-TwoPhasePowerModel = R6Class("TwoPhasePowerModel", inherit=CAGExpansionModel, public=list(
+TwoPhasePowerNoCoefModel = R6Class("TwoPhasePowerNoCoefModel", inherit=CAGExpansionModel, public=list(
     initialize = function(data=NULL) {
-        super$initialize(name="TwoPhasePower",
+        super$initialize(name="TwoPhasePowerNoCoef",
                          data=data,
                          fixed_parameters=
                              list(max_cag = 180, threshold1 = 33.5),

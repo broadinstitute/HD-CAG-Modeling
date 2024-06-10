@@ -97,7 +97,7 @@ CAGModeling$readCellLoss = function(filePath, dataSetList) {
     return(dataSetList)
 }
 
-CAGModeling$readCellFile = function(filePath, donorMap, donors=NULL, regions=NULL, celltypes=NULL, minCAG=35) {
+CAGModeling$readCellFile = function(filePath, donorMap, subtypeMapPath=NULL, donors=NULL, regions=NULL, celltypes=NULL, subtypes=NULL, minCAG=35) {
     result = NULL
     fileData = fread(filePath, header=T, sep="\t")
     cagData = fileData[fileData$REPLENGTH >= minCAG]
@@ -106,6 +106,12 @@ CAGModeling$readCellFile = function(filePath, donorMap, donors=NULL, regions=NUL
         donorList = intersect(donorList, donors)
     }
     donorList = intersect(donorList, names(donorMap))
+    subtypeMap = NULL
+    if (!is.null(subtypeMapPath)) {
+        subtypeData = fread(subtypeMapPath, header=T, sep="\t")
+        subtypeMap = subtypeData$CELLSUBTYPE
+        names(subtypeMap) = subtypeData$CELL_BARCODE
+    }
     for (donor in donorList) {
         donorInfo = donorMap[[donor]]
         donorData = cagData[cagData$DONOR == donor]
@@ -121,10 +127,21 @@ CAGModeling$readCellFile = function(filePath, donorMap, donors=NULL, regions=NUL
             }
             for (cellType in cellTypeList) {
                 cellData = regionData[regionData$CELLTYPE == cellType]
+                if (!is.null(subtypes)) {
+                    cellData = cellData[subtypeMap[cellData$CELL_BARCODE] %in% subtypes]
+                }
                 cags = as.integer(round(cellData$REPLENGTH))
                 cags = sort(cags)
                 if (length(cags) > 0) {
-                    dataSet = CAGDataSet$new(donor=donorInfo, region=region, celltype=cellType, observed=cags)
+                    # This is a bit of a hack.
+                    # If you supply multiple subtypes, they are analyzed together and labeled with the parent cell type.
+                    # Otherwise we label the dataset with the individual cell subtype.
+                    # This is important because cell loss is assigned based on dataSet$celltype.
+                    dataSetCellType = cellType
+                    if (length(subtypes) == 1) {
+                        dataSetCellType = subtypes
+                    }
+                    dataSet = CAGDataSet$new(donor=donorInfo, region=region, celltype=dataSetCellType, observed=cags)
                     result = c(result, dataSet)
                 }
             }
